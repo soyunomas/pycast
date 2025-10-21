@@ -1,4 +1,4 @@
-# receiver.py (SIN CAMBIOS)
+# receiver.py
 import socket
 import threading
 import json
@@ -117,7 +117,8 @@ class Receiver:
         elif ptype == 'eof':
             self._reassemble_file()
             self.joined_session_id = None
-            self.progress_callback(100)
+            # <-- ELIMINADO: Esta llamada es redundante, ya que el último paquete de datos ya lleva el progreso al 100%.
+            # self.progress_callback(100) 
 
     def _reassemble_file(self):
         """Reensambla los trozos recibidos en un archivo final."""

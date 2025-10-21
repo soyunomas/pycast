@@ -5,11 +5,18 @@ import socket
 import json
 import threading
 import os
+import argparse
+import sys
+import time
 
 from sender import Sender, HANDSHAKE_PORT
 from receiver import Receiver
 from service_discovery import PyCastServiceBrowser
 from config_manager import load_config, save_config
+
+# ----------------------------------------------------------------------------
+# ----- PARTE 1: Lógica de la Interfaz Gráfica (GUI) - Sin cambios --------
+# ----------------------------------------------------------------------------
 
 class PyCastApp:
     def __init__(self, root):
@@ -292,9 +299,6 @@ class PyCastApp:
         path = filedialog.askopenfilename()
         if path:
             self.selected_file_path.set(path)
-            # --- CORRECCIÓN AQUÍ ---
-            # Se elimina la condición para que el nombre de la sesión
-            # se actualice SIEMPRE que se selecciona un nuevo archivo.
             self.session_name.set(os.path.basename(path))
             self._set_sender_ui_state('ready')
 
@@ -398,7 +402,198 @@ class PyCastApp:
     def run(self):
         self.root.mainloop()
 
+# ----------------------------------------------------------------------------
+# -------- PARTE 2: Lógica de la Interfaz de Línea de Comandos (CLI) ----------
+# ----------------------------------------------------------------------------
+
+# <-- AÑADIDO: Lock para proteger la salida de la consola de accesos simultáneos
+print_lock = threading.Lock()
+
+def cli_status_callback(message):
+    """Callback para mostrar mensajes de estado en la consola de forma segura."""
+    with print_lock:
+        # Imprime una línea vacía para no sobrescribir la barra de progreso
+        sys.stdout.write('\r' + ' ' * 80 + '\r') 
+        print(f"[INFO] {message}")
+        sys.stdout.flush()
+
+def cli_progress_callback(value, text=None):
+    """Callback para mostrar una barra de progreso en la consola de forma segura."""
+    with print_lock:
+        bar_length = 40
+        progress = int((value / 100) * bar_length)
+        bar = '#' * progress + '-' * (bar_length - progress)
+        percent_str = f"{value:.1f}%"
+        # \r mueve el cursor al inicio, end='' evita el salto de línea
+        sys.stdout.write(f"\rProgreso: [{bar}] {percent_str.rjust(6)}")
+        sys.stdout.flush()
+        if value >= 100:
+            sys.stdout.write('\n')
+
+def cli_client_connected(client_id, username):
+    """Callback para notificar la conexión de un cliente en modo lobby."""
+    with print_lock:
+        print(f"\n[+] Cliente conectado: {username} ({client_id[:8]})")
+
+def cli_client_disconnected(client_id):
+    """Callback para notificar la desconexión de un cliente."""
+    with print_lock:
+        print(f"\n[-] Cliente desconectado: {client_id[:8]}")
+
+def handle_cli_send(args):
+    """Maneja la lógica para el subcomando 'send'."""
+    if not os.path.exists(args.file_path):
+        print(f"Error: El archivo '{args.file_path}' no fue encontrado.", file=sys.stderr)
+        sys.exit(1)
+    
+    config = load_config()
+    session_name = args.name or os.path.basename(args.file_path)
+    
+    sender = Sender(
+        args.file_path,
+        session_name,
+        config.get('username', 'cli-user'),
+        cli_progress_callback,
+        cli_status_callback,
+        cli_client_connected,
+        cli_client_disconnected
+    )
+
+    try:
+        sender.start_session(multiclient=args.multi)
+
+        if args.multi:
+            input("Lobby abierto. Presiona Enter para iniciar la transmisión...")
+            if not sender.connected_clients:
+                print("Advertencia: No hay clientes conectados. Iniciando de todas formas.")
+            sender.start_transmission()
+
+        # Espera activa mientras la transmisión está en curso
+        while sender.is_active or sender.transmission_started:
+            if sender.transmission_started and not sender.is_active:
+                break 
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\nCancelando por el usuario...")
+    finally:
+        sender.stop_session()
+    
+    print("Operación finalizada.")
+
+def handle_cli_receive(args):
+    """Maneja la lógica para el subcomando 'receive'."""
+    config = load_config()
+    output_dir = args.output_dir or config.get('download_folder')
+    if not os.path.isdir(output_dir):
+        print(f"Error: El directorio de salida '{output_dir}' no existe.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Guardando archivos en: {output_dir}")
+
+    active_sessions = {}
+    sessions_lock = threading.Lock()
+    completion_event = threading.Event()
+
+    def on_download_complete():
+        with print_lock:
+            print("\n¡Descarga completada!")
+        completion_event.set()
+
+    receiver = Receiver(cli_progress_callback, cli_status_callback, on_download_complete)
+    
+    def add_s(d):
+        with sessions_lock: active_sessions[d['session_id']] = d
+    def rem_s(sid):
+        with sessions_lock: active_sessions.pop(sid, None)
+    def upd_s(d):
+        with sessions_lock: active_sessions[d['session_id']] = d
+
+    browser = PyCastServiceBrowser(add_s, rem_s, upd_s)
+    receiver.start_listening()
+
+    try:
+        print("Buscando sesiones en la red (Ctrl+C para salir)...")
+        time.sleep(3) # Esperar un poco para descubrir servicios
+
+        with sessions_lock:
+            if not active_sessions:
+                print("No se encontraron sesiones. Saliendo.")
+                return
+            
+            print("\nSesiones disponibles:")
+            session_list = list(active_sessions.values())
+            for i, sess in enumerate(session_list):
+                print(f"  {i+1}) '{sess['session_name']}' por {sess['username']} [{sess['status']}]")
+        
+        choice = input("Elige el número de la sesión a descargar (o 'q' para salir): ")
+        if choice.lower() == 'q': return
+
+        try:
+            index = int(choice) - 1
+            if not (0 <= index < len(session_list)):
+                raise ValueError
+            session_info = session_list[index]
+        except ValueError:
+            print("Selección inválida.", file=sys.stderr)
+            return
+
+        if session_info.get('status') == 'busy':
+            print("Esa sesión está ocupada.", file=sys.stderr)
+            return
+            
+        print(f"Intentando unirse a la sesión '{session_info['session_name']}'...")
+        # Lógica de Handshake (copiada y adaptada de la GUI)
+        try:
+            handshake_sock = socket.create_connection((session_info['address'], HANDSHAKE_PORT), timeout=5)
+            with handshake_sock:
+                payload = json.dumps({
+                    'session_id': session_info['session_id'],
+                    'username': config.get('username')
+                }).encode('utf-8')
+                handshake_sock.sendall(payload)
+                response = handshake_sock.recv(1024)
+                if response == b'ACK_MULTI':
+                    cli_status_callback("Conectado al lobby. Esperando que el emisor inicie...")
+                    handshake_sock.settimeout(None)
+                    start_signal = handshake_sock.recv(1024)
+                    if start_signal != b'START':
+                        raise ConnectionAbortedError("Señal de inicio inválida.")
+                elif response != b'ACK_SINGLE':
+                    raise ConnectionAbortedError("Respuesta de handshake desconocida.")
+            receiver.join_session(session_info['session_id'], output_dir)
+            completion_event.wait() # Esperar a que la descarga termine
+        except Exception as e:
+            print(f"\nError de conexión: {e}", file=sys.stderr)
+
+    except KeyboardInterrupt:
+        print("\nCancelando por el usuario...")
+    finally:
+        browser.stop()
+        receiver.stop_listening()
+
 if __name__ == "__main__":
-    main_window = tk.Tk()
-    app = PyCastApp(main_window)
-    app.run()
+    parser = argparse.ArgumentParser(description="PyCast: Herramienta de transferencia de archivos en LAN.")
+    subparsers = parser.add_subparsers(dest='command', help='Comando a ejecutar')
+
+    # Subcomando 'send'
+    send_parser = subparsers.add_parser('send', help='Enviar un archivo.')
+    send_parser.add_argument('file_path', metavar='ARCHIVO', help='Ruta al archivo que se va a enviar.')
+    send_parser.add_argument('--name', help='Nombre personalizado para la sesión (por defecto: nombre del archivo).')
+    send_parser.add_argument('--multi', action='store_true', help='Habilitar modo multi-cliente (lobby).')
+
+    # Subcomando 'receive'
+    receive_parser = subparsers.add_parser('receive', help='Recibir un archivo.')
+    receive_parser.add_argument('--output-dir', metavar='CARPETA', help='Carpeta para guardar los archivos descargados.')
+
+    args = parser.parse_args()
+
+    if args.command == 'send':
+        handle_cli_send(args)
+    elif args.command == 'receive':
+        handle_cli_receive(args)
+    else:
+        # Si no se especifica ningún comando, se lanza la interfaz gráfica
+        main_window = tk.Tk()
+        app = PyCastApp(main_window)
+        app.run()
