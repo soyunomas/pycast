@@ -1,12 +1,3 @@
-¡Excelente idea! Es fundamental que la documentación refleje todas las capacidades de la aplicación. He actualizado el `README.md` para incluir la nueva funcionalidad de línea de comandos (CLI), explicando su uso con ejemplos claros.
-
-Aquí tienes el archivo `README.md` completo y modificado.
-
----
-
-### Archivo Modificado: `pycast-main/README.md`
-
-```markdown
 # 📡 PyCast
 
 **Herramienta de transferencia de archivos en red local (LAN) simple y potente, utilizando multicast para envíos a múltiples clientes y descubrimiento automático de servicios.**
@@ -164,5 +155,4 @@ sudo ufw allow 5353/udp
 sudo ufw allow 5008/tcp
 sudo ufw allow 5007/udp
 sudo ufw reload
-```
 ```
