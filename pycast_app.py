@@ -8,13 +8,191 @@ import os
 import argparse
 import sys
 import time
-
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
 from sender import Sender, HANDSHAKE_PORT
 from receiver import Receiver
 from service_discovery import PyCastServiceBrowser
 from config_manager import load_config, save_config, get_default_config, CONFIG_METADATA, CONFIG_PRESETS
+
+# --- INICIO: LÓGICA Y FUNCIONES AUXILIARES PARA EL MODO CLI ---
+
+def _cli_print_progress(bytes_processed, total_bytes):
+    """Muestra una barra de progreso en la terminal."""
+    if total_bytes == 0: return
+    percentage = (bytes_processed / total_bytes) * 100
+    bar_len = 40
+    filled_len = int(round(bar_len * percentage / 100.0))
+    bar = '█' * filled_len + '-' * (bar_len - filled_len)
+    
+    processed_mb = bytes_processed / (1024 * 1024)
+    total_mb = total_bytes / (1024 * 1024)
+    
+    sys.stdout.write(f'\rProgreso: [{bar}] {percentage:.1f}% ({processed_mb:.2f}/{total_mb:.2f} MB)')
+    sys.stdout.flush()
+    if bytes_processed == total_bytes:
+        sys.stdout.write('\n')
+
+def run_cli_sender(args, config):
+    """Ejecuta la lógica del emisor en modo CLI."""
+    if not os.path.exists(args.file_path):
+        print(f"Error: El archivo '{args.file_path}' no existe.")
+        return
+
+    session_name = args.name if args.name else os.path.basename(args.file_path)
+    
+    clients_connected = []
+    # --- MODIFICADO: Callback de conexión de cliente mejorado ---
+    prompt_message = f"\n>>> Para iniciar la transmisión para todos, pulsa Enter... "
+    
+    def _client_connected(client_id, username):
+        clients_connected.append(username)
+        # Limpia la línea actual para evitar sobreescribir el prompt de input() de forma desordenada
+        sys.stdout.write('\r' + ' ' * 80 + '\r')
+        print(f"> '{username}' se ha unido al lobby. Clientes actuales: {len(clients_connected)}.")
+        sys.stdout.write(prompt_message)
+        sys.stdout.flush()
+
+    def _client_disconnected(client_id):
+        pass
+
+    sender = Sender(
+        args.file_path,
+        session_name,
+        config,
+        _cli_print_progress,
+        lambda msg: print(f"\n[Estado] {msg}"), # Añadido \n para mejor formato
+        _client_connected,
+        _client_disconnected
+    )
+
+    try:
+        sender.start_session(multiclient=args.multi)
+        
+        if args.multi:
+            print(f"Lobby abierto para la sesión '{session_name}'.")
+            print("Esperando que los clientes se unan...")
+            # Muestra el prompt inicial y espera la entrada del usuario
+            input(prompt_message) 
+            
+            if not clients_connected:
+                print("\nAdvertencia: No hay clientes en el lobby. Iniciando de todas formas.")
+            sender.start_transmission()
+        
+        while sender.is_active:
+            time.sleep(1)
+
+        print("\nOperación finalizada.")
+
+    except KeyboardInterrupt:
+        print("\nOperación cancelada por el usuario.")
+    finally:
+        sender.stop_session()
+
+
+def run_cli_receiver(args, config):
+    """Ejecuta la lógica del receptor en modo CLI."""
+    active_sessions = {}
+    sessions_lock = threading.Lock()
+    download_complete_event = threading.Event()
+    download_status = "pending"
+
+    def _add_session(details):
+        with sessions_lock:
+            active_sessions[details['session_id']] = details
+    
+    def _remove_session(session_id):
+        with sessions_lock:
+            active_sessions.pop(session_id, None)
+
+    def _on_cli_download_complete(status):
+        nonlocal download_status
+        download_status = status
+        download_complete_event.set()
+
+    receiver = Receiver(config, _cli_print_progress, lambda msg: print(f"[Estado] {msg}"), _on_cli_download_complete)
+    service_browser = PyCastServiceBrowser(_add_session, _remove_session, _add_session)
+    
+    try:
+        receiver.start_listening()
+        print("Buscando sesiones en la red (Ctrl+C para salir)...")
+        
+        chosen_session = None
+        while not chosen_session:
+            time.sleep(2)
+            with sessions_lock:
+                if not active_sessions:
+                    print("\rEsperando sesiones...", end="")
+                    sys.stdout.flush()
+                    continue
+
+                print("\n\nSesiones disponibles:")
+                sorted_sessions = sorted(active_sessions.values(), key=lambda x: x['session_name'])
+                for i, details in enumerate(sorted_sessions):
+                    print(f"  {i+1}) '{details['session_name']}' por {details['username']} [{details['status']}]")
+
+            try:
+                choice = input("\nElige el número de la sesión a descargar (o 'q' para salir): ")
+                if choice.lower() == 'q':
+                    return
+                choice_idx = int(choice) - 1
+                if 0 <= choice_idx < len(sorted_sessions):
+                    session_info = sorted_sessions[choice_idx]
+                    if session_info['status'] != 'available':
+                        print("Esa sesión no está disponible (está ocupada). Inténtalo de nuevo.")
+                        continue
+                    chosen_session = session_info
+                else:
+                    print("Selección inválida.")
+            except ValueError:
+                print("Por favor, introduce un número.")
+
+        output_dir = args.output_dir if args.output_dir else config['download_folder']
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            print(f"Carpeta de destino creada: {output_dir}")
+
+        print(f"Intentando conectar con la sesión '{chosen_session['session_name']}'...")
+        
+        try:
+            handshake_sock = socket.create_connection((chosen_session['address'], HANDSHAKE_PORT), timeout=10)
+            with handshake_sock:
+                payload = json.dumps({'session_id': chosen_session['session_id'], 'username': config.get('username')}).encode('utf-8')
+                handshake_sock.sendall(payload)
+                response = handshake_sock.recv(1024)
+                if response == b'ACK_MULTI':
+                    print("Conectado al lobby. Esperando que el emisor inicie la transmisión...")
+                    handshake_sock.settimeout(None)
+                    start_signal = handshake_sock.recv(1024)
+                    if start_signal != b'START':
+                        raise ConnectionAbortedError("Señal de inicio inválida.")
+                elif response != b'ACK_SINGLE':
+                    raise ConnectionAbortedError("Respuesta de handshake desconocida.")
+            
+            receiver.join_session(chosen_session, output_dir)
+            print("¡Conexión exitosa! Esperando datos...")
+            
+            download_complete_event.wait()
+            
+            if download_status == "completed":
+                print("\n¡Descarga completada y verificada con éxito!")
+            elif download_status == "failed_verification":
+                print("\n¡ERROR! El archivo recibido estaba corrupto y ha sido eliminado.")
+            else:
+                print("\nLa descarga fue cancelada.")
+
+        except (socket.timeout, ConnectionRefusedError, OSError, ConnectionAbortedError) as e:
+            print(f"\nError de Conexión: No se pudo contactar al emisor. {e}")
+
+    except KeyboardInterrupt:
+        print("\nOperación cancelada por el usuario.")
+    finally:
+        if service_browser: service_browser.stop()
+        if receiver: receiver.stop_listening()
+        print("Cerrando la aplicación CLI.")
+
+# --- FIN: LÓGICA Y FUNCIONES AUXILIARES PARA EL MODO CLI ---
+
 
 # Clase auxiliar para crear Tooltips (cuadros de ayuda)
 class Tooltip:
@@ -531,7 +709,6 @@ class PyCastApp:
         
     def _on_download_complete(self, status="completed"):
         def task():
-            # --- MODIFICADO: Manejar los diferentes estados de finalización ---
             if status == "completed":
                 self.progress_var.set(100)
                 self.progress_text.set("¡Descarga completa!")
@@ -540,7 +717,6 @@ class PyCastApp:
                 self.progress_var.set(0)
                 self.progress_text.set("Descarga cancelada")
                 self._update_status("La descarga fue cancelada. Listo para una nueva descarga.")
-            # --- NUEVO: Manejar el fallo de verificación ---
             elif status == "failed_verification":
                 self.progress_var.set(0)
                 self.progress_text.set("¡Verificación fallida!")
@@ -632,23 +808,45 @@ class PyCastApp:
         self.root.mainloop()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PyCast: Herramienta de transferencia de archivos en LAN.")
-    subparsers = parser.add_subparsers(dest='command', help='Comando a ejecutar')
+    # --- MODIFICADO: argparse con ayuda mejorada y ejemplos ---
+    examples = """
+Ejemplos de uso:
+  # Enviar un archivo en modo directo (un solo receptor)
+  python pycast_app.py send ./documento.pdf
+
+  # Enviar un archivo a múltiples receptores con un nombre de sesión personalizado
+  python pycast_app.py send ./fotos.zip --name "Fotos de la Fiesta" --multi
+
+  # Buscar y recibir un archivo en la carpeta por defecto
+  python pycast_app.py receive
+
+  # Recibir un archivo y guardarlo en una carpeta específica
+  python pycast_app.py receive --output-dir /tmp/descargas/
+"""
+    parser = argparse.ArgumentParser(
+        description="PyCast: Herramienta de transferencia de archivos en LAN.",
+        epilog=examples,
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    subparsers = parser.add_subparsers(dest='command', help='Comandos:')
+    
     send_parser = subparsers.add_parser('send', help='Enviar un archivo.')
     send_parser.add_argument('file_path', metavar='ARCHIVO', help='Ruta al archivo que se va a enviar.')
     send_parser.add_argument('--name', help='Nombre personalizado para la sesión (por defecto: nombre del archivo).')
-    send_parser.add_argument('--multi', action='store_true', help='Habilitar modo multi-cliente (lobby).')
+    send_parser.add_argument('--multi', action='store_true', help='Habilitar modo multi-cliente (lobby). Se esperará a que el usuario presione Enter para iniciar la transmisión.')
+    
     receive_parser = subparsers.add_parser('receive', help='Recibir un archivo.')
-    receive_parser.add_argument('--output-dir', metavar='CARPETA', help='Carpeta para guardar los archivos descargados.')
+    receive_parser.add_argument('--output-dir', metavar='CARPETA', help='Carpeta para guardar los archivos descargados (por defecto: la configurada en la app).')
+    
     args = parser.parse_args()
 
-    if args.command == 'send' or args.command == 'receive':
+    if args.command in ['send', 'receive']:
         print("La configuración de red desde config.json se usará para la CLI.")
-    
-    if args.command == 'send':
-        pass
-    elif args.command == 'receive':
-        pass
+        config = load_config()
+        if args.command == 'send':
+            run_cli_sender(args, config)
+        elif args.command == 'receive':
+            run_cli_receiver(args, config)
     else:
         main_window = TkinterDnD.Tk()
         app = PyCastApp(main_window)
