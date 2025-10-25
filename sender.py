@@ -5,42 +5,63 @@ import os
 import json
 import uuid
 import time
-import base64
+import zlib
 from service_discovery import ServiceAnnouncer
 
-# --- Constantes de Red ---
+# --- Constantes de Red (solo las que no son configurables) ---
 MULTICAST_GROUP = '239.192.1.100'
 MULTICAST_PORT = 5007
 MULTICAST_TTL = 1
 HANDSHAKE_PORT = 5008
+NACK_PORT = 5009
 
-# --- Constantes de Transmisión ---
-CHUNK_SIZE = 1024
+def _calculate_file_crc32(file_path):
+    """Calcula el checksum CRC32 de un archivo leyéndolo en trozos."""
+    crc_value = 0
+    with open(file_path, 'rb') as f:
+        while chunk := f.read(65536):  # Leer en trozos de 64KB
+            crc_value = zlib.crc32(chunk, crc_value)
+    return crc_value
 
 class Sender:
-    def __init__(self, file_path, session_name, username, progress_callback, status_callback, 
+    def __init__(self, file_path, session_name, config, progress_callback, status_callback, 
                  client_connected_callback=None, client_disconnected_callback=None):
         self.file_path = file_path
         self.session_name = session_name
+        self.config = config
+        self.username = config.get('username')
         self.session_id = str(uuid.uuid4())
-        self.username = username
         
-        # Callbacks
         self.progress_callback = progress_callback
         self.status_callback = status_callback
         self.client_connected_callback = client_connected_callback
         self.client_disconnected_callback = client_disconnected_callback
+        
+        net_conf = self.config.get('network_settings')
+        self.CHUNK_SIZE = net_conf.get('chunk_size', 8192)
+        self.BLOCK_SIZE_PACKETS = net_conf.get('block_size_packets', 256)
+        self.REPAIR_ROUNDS = net_conf.get('repair_rounds', 5)
+        self.NACK_LISTEN_TIMEOUT = net_conf.get('nack_listen_timeout', 0.2)
+
+        # --- NUEVO: Imprimir configuración al inicio ---
+        print("\n--- [SENDER] Configuración de Red Inicial ---")
+        print(f"  - CHUNK_SIZE: {self.CHUNK_SIZE} bytes")
+        print(f"  - BLOCK_SIZE_PACKETS: {self.BLOCK_SIZE_PACKETS} paquetes")
+        print(f"  - REPAIR_ROUNDS: {self.REPAIR_ROUNDS} rondas")
+        print(f"  - NACK_LISTEN_TIMEOUT: {self.NACK_LISTEN_TIMEOUT} segundos")
+        print("-------------------------------------------\n")
 
         self.is_active = False
         self.transmission_started = False
-        self.multiclient_mode = False # Se establecerá desde la app
+        self.multiclient_mode = False
         
-        # Sockets y Threads
         self.session_thread = None
         self.service_announcer = None
         self.handshake_socket = None
-        self.connected_clients = {} # {client_id: {'conn': conn, 'username': name}}
+        self.connected_clients = {}
         self.clients_lock = threading.Lock()
+        
+        self.transmission_start_event = threading.Event()
 
     def start_session(self, multiclient=False):
         if not os.path.exists(self.file_path):
@@ -53,44 +74,43 @@ class Sender:
         self.session_thread.start()
 
     def stop_session(self):
-        self.is_active = False
+        was_active = self.is_active
+        self.is_active = False 
+        self.transmission_started = False
+        self.transmission_start_event.set()
         
-        local_ip_to_unblock = None
-        if self.service_announcer:
-            local_ip_to_unblock = self.service_announcer.local_ip
-            self.service_announcer.stop()
-        
-        with self.clients_lock:
-            for client_id, client_data in self.connected_clients.items():
-                try:
-                    client_data['conn'].close()
-                except: pass
-            self.connected_clients.clear()
+        if was_active: self._send_cancellation_message()
+        if self.service_announcer: self.service_announcer.stop()
 
         if self.handshake_socket:
             try:
-                if local_ip_to_unblock:
-                    socket.create_connection((local_ip_to_unblock, HANDSHAKE_PORT), timeout=0.1)
-            except: pass
-            finally:
-                self.handshake_socket.close()
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(('127.0.0.1', HANDSHAKE_PORT))
+            except socket.error: pass
+            finally: self.handshake_socket.close()
         
         self.status_callback("Sesión cancelada.")
 
+    def _send_cancellation_message(self):
+        cancel_packet = {"type": "cancel", "session_id": self.session_id}
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MULTICAST_TTL)
+                for _ in range(3): 
+                    sock.sendto(json.dumps(cancel_packet).encode('utf-8'), (MULTICAST_GROUP, MULTICAST_PORT))
+                    time.sleep(0.02)
+        except Exception as e:
+            print(f"Error enviando mensaje de cancelación: {e}")
+
     def _session_lifecycle(self):
-        self.service_announcer = ServiceAnnouncer(
-            self.session_id, self.session_name, HANDSHAKE_PORT, self.username
-        )
+        self.service_announcer = ServiceAnnouncer(self.session_id, self.session_name, HANDSHAKE_PORT, self.username)
         self.service_announcer.start()
         
-        if self.multiclient_mode:
-            self._run_multiclient_lobby()
-        else:
-            self._run_single_client_session()
+        if self.multiclient_mode: self._run_multiclient_lobby()
+        else: self._run_single_client_session()
         
-        if self.service_announcer:
-            self.service_announcer.stop()
+        if self.service_announcer: self.service_announcer.stop()
         self.is_active = False
+        self.transmission_started = False
 
     def _run_single_client_session(self):
         self.status_callback("Esperando a que un receptor se conecte...")
@@ -98,77 +118,70 @@ class Sender:
         
         if self.is_active and receiver_info:
             self.service_announcer.update_status('busy')
-            receiver_name = receiver_info.get('username', 'un receptor')
-            self.status_callback(f"Conectado con '{receiver_name}'. Iniciando envío...")
+            self.status_callback(f"Conectado con '{receiver_info.get('username', 'un receptor')}'. Iniciando envío...")
+            self.transmission_started = True
             self._transmit_file()
 
     def _run_multiclient_lobby(self):
+        self.transmission_start_event.clear()
         self.handshake_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.handshake_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             self.handshake_socket.bind(('', HANDSHAKE_PORT))
             self.handshake_socket.listen()
             self.status_callback("Lobby abierto. Esperando conexiones...")
-
             while self.is_active and not self.transmission_started:
                 try:
                     conn, addr = self.handshake_socket.accept()
-                    if not self.is_active: break
-                    handler_thread = threading.Thread(target=self._handle_client_connection, args=(conn, addr))
-                    handler_thread.daemon = True
+                    if not self.is_active or self.transmission_started: 
+                        conn.close()
+                        break
+                    handler_thread = threading.Thread(target=self._handle_client_connection, args=(conn, addr)); handler_thread.daemon = True
                     handler_thread.start()
-                except socket.error:
-                    break # El socket fue cerrado por stop_session
+                except socket.error: break
         finally:
-            self.handshake_socket.close()
+            if self.handshake_socket: self.handshake_socket.close()
 
     def _handle_client_connection(self, conn, addr):
         client_id = str(uuid.uuid4())
         try:
-            data = conn.recv(1024)
-            if not data: return
-            
-            request = json.loads(data.decode('utf-8'))
-            if request.get('session_id') != self.session_id:
-                conn.close()
-                return
+            request = json.loads(conn.recv(1024).decode('utf-8'))
+            if request.get('session_id') != self.session_id: return
 
-            conn.sendall(b'ACK_MULTI') # Avisar al cliente que es modo lobby
-            
+            conn.sendall(b'ACK_MULTI')
             username = request.get('username', f'Cliente {addr[0]}')
+            
             with self.clients_lock:
-                self.connected_clients[client_id] = {'conn': conn, 'username': username}
+                self.connected_clients[client_id] = {'username': username}
             
             if self.client_connected_callback:
                 self.client_connected_callback(client_id, username)
-        except (json.JSONDecodeError, OSError, ConnectionResetError):
-            conn.close()
+
+            self.transmission_start_event.wait()
+
+            if self.is_active and self.transmission_started:
+                try:
+                    conn.sendall(b'START')
+                except OSError: pass
+        
+        except (json.JSONDecodeError, OSError, ConnectionResetError) as e:
+            print(f"Error de conexión en el lobby con {addr}: {e}")
+        
+        finally:
+            try: conn.close()
+            except: pass
             with self.clients_lock:
-                self.connected_clients.pop(client_id, None)
+                if client_id in self.connected_clients: self.connected_clients.pop(client_id)
             if self.client_disconnected_callback:
                 self.client_disconnected_callback(client_id)
 
     def start_transmission(self):
-        if not self.multiclient_mode or self.transmission_started:
-            return
-        
+        if not self.multiclient_mode or self.transmission_started: return
         self.transmission_started = True
-        self.is_active = False # Para detener el bucle de accept()
-        
-        self.service_announcer.update_status('busy')
+        if self.service_announcer: self.service_announcer.update_status('busy')
         self.status_callback("Cerrando lobby e iniciando transmisión...")
-        
-        with self.clients_lock:
-            for client_data in self.connected_clients.values():
-                try:
-                    client_data['conn'].sendall(b'START')
-                    client_data['conn'].close()
-                except OSError:
-                    pass # El cliente pudo haberse desconectado
-        
-        # Pequeña pausa para que los clientes procesen la señal START
+        self.transmission_start_event.set()
         time.sleep(0.5) 
-        self.is_active = True # Reactivamos para la transmisión
         self._transmit_file()
 
     def _listen_for_single_handshake(self):
@@ -177,69 +190,131 @@ class Sender:
         try:
             self.handshake_socket.bind(('', HANDSHAKE_PORT))
             self.handshake_socket.listen(1)
-            conn, addr = self.handshake_socket.accept()
+            conn, _ = self.handshake_socket.accept()
             with conn:
                 if not self.is_active: return None
-                data = conn.recv(1024)
-                conn.sendall(b'ACK_SINGLE') # Avisar que la transmisión es inmediata
-                request = json.loads(data.decode('utf-8'))
-                if request.get('session_id') == self.session_id:
-                    return request
+                request = json.loads(conn.recv(1024).decode('utf-8'))
+                conn.sendall(b'ACK_SINGLE')
+                if request.get('session_id') == self.session_id: return request
             return None
-        except Exception:
-            return None
+        except Exception: return None
         finally:
-            if self.handshake_socket:
-                self.handshake_socket.close()
+            if self.handshake_socket: self.handshake_socket.close()
+
 
     def _transmit_file(self):
-        multicast_socket = None
+        multicast_socket, nack_socket = None, None
         try:
             multicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MULTICAST_TTL)
-            
+            nack_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            nack_socket.bind(('', NACK_PORT))
+            nack_socket.setblocking(False)
+
             file_size = os.path.getsize(self.file_path)
-            file_name = os.path.basename(self.file_path)
-            total_chunks = (file_size // CHUNK_SIZE) + (1 if file_size % CHUNK_SIZE > 0 else 0)
+            
+            self.status_callback("Calculando checksum del archivo...")
+            file_crc32 = _calculate_file_crc32(self.file_path)
+            self.status_callback("Checksum calculado. Iniciando envío...")
+            
+            total_chunks = (file_size // self.CHUNK_SIZE) + (1 if file_size % self.CHUNK_SIZE > 0 else 0)
+            total_blocks = (total_chunks // self.BLOCK_SIZE_PACKETS) + (1 if total_chunks % self.BLOCK_SIZE_PACKETS > 0 else 0)
 
             metadata = {
                 "type": "metadata", "session_id": self.session_id, "session_name": self.session_name,
-                "file_name": file_name, "file_size": file_size, "total_chunks": total_chunks
+                "file_name": os.path.basename(self.file_path), "file_size": file_size, 
+                "file_crc32": file_crc32,
+                "total_chunks": total_chunks,
+                # Parámetros de red
+                "chunk_size": self.CHUNK_SIZE, 
+                "block_size_packets": self.BLOCK_SIZE_PACKETS,
+                "nack_listen_timeout": self.NACK_LISTEN_TIMEOUT,
+                "repair_rounds": self.REPAIR_ROUNDS
             }
             for _ in range(3):
                 if not self.is_active: break
                 multicast_socket.sendto(json.dumps(metadata).encode('utf-8'), (MULTICAST_GROUP, MULTICAST_PORT))
                 time.sleep(0.1)
 
-            with open(self.file_path, 'rb') as f:
-                for seq_num in range(total_chunks):
-                    if not self.is_active:
-                        self.status_callback("Transmisión cancelada.")
-                        break
-                    chunk = f.read(CHUNK_SIZE)
-                    if not chunk: break
-                    
-                    payload = base64.b64encode(chunk).decode('utf-8')
-                    data_packet = {
-                        "type": "data", "session_id": self.session_id, "seq": seq_num, "payload": payload
-                    }
-                    multicast_socket.sendto(json.dumps(data_packet).encode('utf-8'), (MULTICAST_GROUP, MULTICAST_PORT))
-                    
-                    progress = ((seq_num + 1) / total_chunks) * 100
-                    self.progress_callback(progress)
-                    time.sleep(0.001)
+            if not self.is_active: return
             
-            if self.is_active:
+            session_id_bytes = uuid.UUID(self.session_id).bytes
+            
+            with open(self.file_path, 'rb') as f:
+                for block_idx in range(total_blocks):
+                    if not self.is_active: break
+                    start_seq = block_idx * self.BLOCK_SIZE_PACKETS
+                    end_seq = min((block_idx + 1) * self.BLOCK_SIZE_PACKETS, total_chunks)
+                    
+                    print(f"\n[SND] Enviando bloque {block_idx} (paquetes {start_seq}-{end_seq-1})...")
+
+                    for seq_num in range(start_seq, end_seq):
+                        if not self.is_active: break
+                        f.seek(seq_num * self.CHUNK_SIZE)
+                        packet = session_id_bytes + seq_num.to_bytes(4, 'big') + f.read(self.CHUNK_SIZE)
+                        multicast_socket.sendto(packet, (MULTICAST_GROUP, MULTICAST_PORT))
+                        time.sleep(0.0001)
+                    
+                    if not self.is_active: break
+
+                    last_round_had_nacks = False
+                    for repair_round in range(self.REPAIR_ROUNDS):
+                        if not self.is_active: break
+                        
+                        print(f"[SND] Fin del bloque {block_idx}. Ronda de reparación {repair_round + 1}/{self.REPAIR_ROUNDS}. Esperando NACKs...")
+                        
+                        block_end_packet = {"type": "block_end", "session_id": self.session_id, "block_index": block_idx}
+                        for _ in range(2):
+                            multicast_socket.sendto(json.dumps(block_end_packet).encode('utf-8'), (MULTICAST_GROUP, MULTICAST_PORT))
+                            time.sleep(0.01)
+
+                        missing_seqs = set()
+                        listen_end = time.time() + self.NACK_LISTEN_TIMEOUT
+                        while time.time() < listen_end:
+                            if not self.is_active: break
+                            try:
+                                data, addr = nack_socket.recvfrom(4096)
+                                nack_req = json.loads(data.decode('utf-8'))
+                                if nack_req.get('session_id') == self.session_id and nack_req.get('block_index') == block_idx:
+                                    print(f"[SND] RECIBIDO NACK de {addr} para bloque {block_idx}: {len(nack_req.get('missing_seqs', []))} paquetes.")
+                                    missing_seqs.update(nack_req.get('missing_seqs', []))
+                            except (BlockingIOError, json.JSONDecodeError): 
+                                time.sleep(0.01)
+
+                        if not missing_seqs:
+                            print(f"[SND] Bloque {block_idx} confirmado. No se recibieron NACKs. Avanzando.")
+                            last_round_had_nacks = False
+                            break
+
+                        last_round_had_nacks = True
+                        print(f"[SND] Retransmitiendo {len(missing_seqs)} paquetes para el bloque {block_idx}.")
+                        
+                        for seq_num in sorted(list(missing_seqs)):
+                            if not self.is_active: break
+                            f.seek(seq_num * self.CHUNK_SIZE)
+                            packet = session_id_bytes + seq_num.to_bytes(4, 'big') + f.read(self.CHUNK_SIZE)
+                            multicast_socket.sendto(packet, (MULTICAST_GROUP, MULTICAST_PORT))
+                            time.sleep(0.0002)
+
+                    if last_round_had_nacks:
+                        print(f"[SND] ADVERTENCIA: Se superaron las rondas de reparación para el bloque {block_idx}. Puede haber clientes desincronizados.")
+
+                    bytes_processed = min(end_seq * self.CHUNK_SIZE, file_size)
+                    self.progress_callback(bytes_processed, file_size)
+
+            if self.is_active: 
+                print("[SND] Transmisión completada. Enviando EOF.")
                 self.status_callback("Transmisión completada.")
-                self.progress_callback(100)
             
         except Exception as e:
-            self.status_callback(f"Error en transmisión: {e}")
+            if self.is_active: self.status_callback(f"Error en transmisión: {e}")
         finally:
-            eof_packet = {"type": "eof", "session_id": self.session_id}
-            for _ in range(3):
-                if multicast_socket:
-                    multicast_socket.sendto(json.dumps(eof_packet).encode('utf-8'), (MULTICAST_GROUP, MULTICAST_PORT))
-                time.sleep(0.1)
-            if multicast_socket:
-                multicast_socket.close()
+            if self.is_active:
+                eof_packet = {"type": "eof", "session_id": self.session_id}
+                for _ in range(5):
+                    if multicast_socket: multicast_socket.sendto(json.dumps(eof_packet).encode('utf-8'), (MULTICAST_GROUP, MULTICAST_PORT))
+                    time.sleep(0.1)
+            
+            if multicast_socket: multicast_socket.close()
+            if nack_socket: nack_socket.close()
+            self.is_active = self.transmission_started = False

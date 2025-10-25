@@ -1,2 +1,3 @@
 ifaddr
 zeroconf
+tkinterdnd2

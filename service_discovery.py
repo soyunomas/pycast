@@ -1,4 +1,4 @@
-# service_discovery.py (SIN CAMBIOS)
+# service_discovery.py
 import threading
 import socket
 import time
@@ -102,10 +102,15 @@ class PyCastListener:
         self.add_callback = add_callback
         self.remove_callback = remove_callback
         self.update_callback = update_callback
+        # --- NUEVO: Caché para evitar llamadas bloqueantes en los callbacks ---
+        self.known_services = {}
 
     def _get_service_details(self, zeroconf, type, name):
-        """Función de ayuda para extraer detalles de un servicio."""
-        info = zeroconf.get_service_info(type, name)
+        """Función de ayuda para extraer detalles de un servicio.
+        NOTA: Esta función AHORA SÍ puede ser bloqueante, pero se llamará de forma segura.
+        """
+        # El timeout evita que la llamada se bloquee indefinidamente
+        info = zeroconf.get_service_info(type, name, timeout=1000) # 1 segundo timeout
         if not info or not info.properties:
             return None
         
@@ -116,16 +121,21 @@ class PyCastListener:
         return properties
 
     def remove_service(self, zeroconf, type, name):
-        details = self._get_service_details(zeroconf, type, name)
-        if details:
+        """Manejador no bloqueante para cuando un servicio desaparece."""
+        if name in self.known_services:
+            details = self.known_services.pop(name)
             self.remove_callback(details['session_id'])
 
     def add_service(self, zeroconf, type, name):
+        """Manejador para cuando un nuevo servicio es descubierto."""
         details = self._get_service_details(zeroconf, type, name)
         if details:
+            self.known_services[name] = details
             self.add_callback(details)
     
     def update_service(self, zeroconf, type, name):
+        """Manejador para cuando un servicio existente cambia sus propiedades."""
         details = self._get_service_details(zeroconf, type, name)
         if details:
+            self.known_services[name] = details
             self.update_callback(details)
