@@ -5,14 +5,13 @@ import json
 import os
 import uuid
 import shutil
-import zlib  # NUEVO: Importado para calcular el checksum CRC32
+import zlib
 
 # --- Constantes de Red ---
 MULTICAST_GROUP = '239.192.1.100'
 MULTICAST_PORT = 5007
 NACK_PORT = 5009
 
-# NUEVO: Función de ayuda para calcular CRC32 en trozos (eficiente con la memoria)
 def _calculate_file_crc32(file_path):
     """Calcula el checksum CRC32 de un archivo leyéndolo en trozos."""
     crc_value = 0
@@ -34,7 +33,6 @@ class Receiver:
         self.CHUNK_SIZE = self.config.get('network_settings', {}).get('chunk_size', 8192)
         self.BUFFER_SIZE = 32768 + 2048 
 
-        # --- NUEVO: Imprimir configuración por defecto al inicio ---
         print("\n--- [RECEIVER] Configuración de Red Inicial (Local) ---")
         print(f"  - CHUNK_SIZE (default): {self.CHUNK_SIZE} bytes")
         print(f"  - BUFFER_SIZE (fijo): {self.BUFFER_SIZE} bytes")
@@ -84,7 +82,8 @@ class Receiver:
 
     def join_session(self, session_info, destination_folder):
         self._cleanup_temp_file()
-        self.current_session_info.clear()
+        # --- CORREGIDO: Copiamos los datos iniciales, pero se sobreescribirán con los metadatos reales ---
+        self.current_session_info = session_info.copy()
         self.progress_callback(0, 0)
         self.received_seqs_current_block.clear()
         self.last_processed_block = -1
@@ -122,7 +121,8 @@ class Receiver:
                 self.status_callback("La transmisión fue cancelada por el emisor.")
                 self._cleanup_temp_file()
                 self.joined_session_id = None
-                self.completion_callback(status="cancelled")
+                # --- MODIFICADO: Notificar cancelación con metadata nula ---
+                self.completion_callback(status="cancelled", metadata=None)
         
         except (json.JSONDecodeError, UnicodeDecodeError):
             if not self.output_file: return
@@ -171,21 +171,20 @@ class Receiver:
             self.status_callback(f"Bloque {block_idx + 1} recibido correctamente.")
 
     def _handle_metadata(self, packet):
+        # --- CORREGIDO: Los metadatos del paquete son la fuente de verdad. Reemplazamos info anterior. ---
         self.current_session_info.update(packet)
         
         original_chunk_size = self.CHUNK_SIZE
         self.CHUNK_SIZE = self.current_session_info.get('chunk_size', self.CHUNK_SIZE)
         
-        # --- NUEVO: Imprimir la configuración recibida del emisor ---
         print("\n--- [RECEIVER] Configuración de Red Recibida del Emisor ---")
         if self.CHUNK_SIZE != original_chunk_size:
             print(f"  - CHUNK_SIZE: {self.CHUNK_SIZE} bytes (Cambiado desde {original_chunk_size})")
         else:
             print(f"  - CHUNK_SIZE: {self.CHUNK_SIZE} bytes (Coincide con el local)")
         
+        print(f"  - FILE_NAME (real): {self.current_session_info.get('file_name')}")
         print(f"  - BLOCK_SIZE_PACKETS: {self.current_session_info.get('block_size_packets')}")
-        print(f"  - REPAIR_ROUNDS: {self.current_session_info.get('repair_rounds')}")
-        print(f"  - NACK_LISTEN_TIMEOUT: {self.current_session_info.get('nack_listen_timeout')}")
         print("-----------------------------------------------------------\n")
 
         self.temp_file_path = os.path.join(self.current_session_info['destination_folder'], f".{self.current_session_info['file_name']}.pycast-tmp")
@@ -218,7 +217,8 @@ class Receiver:
 
             if expected_crc is None:
                 self.status_callback(f"Archivo '{self.current_session_info['file_name']}' descargado. (Sin verificación CRC)")
-                self.completion_callback(status="completed")
+                # --- MODIFICADO: Pasar metadatos al callback ---
+                self.completion_callback(status="completed", metadata=self.current_session_info)
                 return
 
             received_crc = _calculate_file_crc32(output_path)
@@ -228,12 +228,14 @@ class Receiver:
                 self.status_callback(f"Archivo '{self.current_session_info['file_name']}' descargado y verificado con éxito.")
                 total_bytes = self.current_session_info.get('file_size', 1)
                 self.progress_callback(total_bytes, total_bytes)
-                self.completion_callback(status="completed")
+                # --- MODIFICADO: Pasar metadatos al callback ---
+                self.completion_callback(status="completed", metadata=self.current_session_info)
             else:
                 print(f"[RCV] ¡FALLO DE VERIFICACIÓN! Esperado: (size={expected_size}, crc={expected_crc}), Recibido: (size={received_size}, crc={received_crc})")
                 self.status_callback("¡ERROR! El archivo está corrupto. Eliminando...")
                 os.remove(output_path) 
-                self.completion_callback(status="failed_verification")
+                # --- MODIFICADO: Pasar metadatos al callback ---
+                self.completion_callback(status="failed_verification", metadata=self.current_session_info)
 
         except Exception as e:
             self.status_callback(f"Error al finalizar la descarga: {e}")

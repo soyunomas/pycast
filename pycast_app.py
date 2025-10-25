@@ -8,6 +8,8 @@ import os
 import argparse
 import sys
 import time
+import shutil
+import zipfile
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
 from sender import Sender, HANDSHAKE_PORT
@@ -16,6 +18,9 @@ from service_discovery import PyCastServiceBrowser
 from config_manager import load_config, save_config, get_default_config, CONFIG_METADATA, CONFIG_PRESETS
 
 # --- INICIO: LÓGICA Y FUNCIONES AUXILIARES PARA EL MODO CLI ---
+
+# Extensión para archivos de carpetas comprimidas
+FOLDER_PACKAGE_EXTENSION = ".pycast.zip"
 
 def _cli_print_progress(bytes_processed, total_bytes):
     """Muestra una barra de progreso en la terminal."""
@@ -36,58 +41,92 @@ def _cli_print_progress(bytes_processed, total_bytes):
 def run_cli_sender(args, config):
     """Ejecuta la lógica del emisor en modo CLI."""
     if not os.path.exists(args.file_path):
-        print(f"Error: El archivo '{args.file_path}' no existe.")
+        print(f"Error: La ruta '{args.file_path}' no existe.")
         return
 
-    session_name = args.name if args.name else os.path.basename(args.file_path)
-    
-    clients_connected = []
-    # --- MODIFICADO: Callback de conexión de cliente mejorado ---
-    prompt_message = f"\n>>> Para iniciar la transmisión para todos, pulsa Enter... "
-    
-    def _client_connected(client_id, username):
-        clients_connected.append(username)
-        # Limpia la línea actual para evitar sobreescribir el prompt de input() de forma desordenada
-        sys.stdout.write('\r' + ' ' * 80 + '\r')
-        print(f"> '{username}' se ha unido al lobby. Clientes actuales: {len(clients_connected)}.")
-        sys.stdout.write(prompt_message)
-        sys.stdout.flush()
-
-    def _client_disconnected(client_id):
-        pass
-
-    sender = Sender(
-        args.file_path,
-        session_name,
-        config,
-        _cli_print_progress,
-        lambda msg: print(f"\n[Estado] {msg}"), # Añadido \n para mejor formato
-        _client_connected,
-        _client_disconnected
-    )
+    file_to_send = args.file_path
+    temp_zip_path = None
 
     try:
-        sender.start_session(multiclient=args.multi)
-        
-        if args.multi:
-            print(f"Lobby abierto para la sesión '{session_name}'.")
-            print("Esperando que los clientes se unan...")
-            # Muestra el prompt inicial y espera la entrada del usuario
-            input(prompt_message) 
+        if os.path.isdir(file_to_send):
+            print(f"La ruta es una carpeta. Comprimiendo '{os.path.basename(file_to_send)}'...")
             
-            if not clients_connected:
-                print("\nAdvertencia: No hay clientes en el lobby. Iniciando de todas formas.")
-            sender.start_transmission()
+            # --- CORRECCIÓN PARA INCLUIR CARPETA RAÍZ EN EL ZIP ---
+            # Se usan rutas absolutas para que shutil.make_archive funcione correctamente
+            # independientemente del directorio de trabajo actual.
+            folder_to_zip = os.path.abspath(file_to_send)
+            base_name = os.path.basename(folder_to_zip)
+            parent_dir = os.path.dirname(folder_to_zip)
+            
+            # El nombre base del archivo zip se genera en el directorio original para evitar conflictos.
+            zip_base_path = os.path.join(os.path.dirname(args.file_path), os.path.basename(args.file_path))
+
+            temp_zip_path = shutil.make_archive(
+                base_name=zip_base_path,
+                format='zip',
+                root_dir=parent_dir,
+                base_dir=base_name
+            )
+            # --- FIN DE LA CORRECCIÓN ---
+            
+            final_zip_path = temp_zip_path.replace('.zip', FOLDER_PACKAGE_EXTENSION)
+            os.rename(temp_zip_path, final_zip_path)
+            temp_zip_path = final_zip_path
+            
+            file_to_send = temp_zip_path
+            print(f"Carpeta comprimida en: {file_to_send}")
+
+        session_name = args.name if args.name else os.path.basename(args.file_path)
         
-        while sender.is_active:
-            time.sleep(1)
+        clients_connected = []
+        prompt_message = f"\n>>> Para iniciar la transmisión para todos, pulsa Enter... "
+        
+        def _client_connected(client_id, username):
+            clients_connected.append(username)
+            sys.stdout.write('\r' + ' ' * 80 + '\r')
+            print(f"> '{username}' se ha unido al lobby. Clientes actuales: {len(clients_connected)}.")
+            sys.stdout.write(prompt_message)
+            sys.stdout.flush()
 
-        print("\nOperación finalizada.")
+        def _client_disconnected(client_id):
+            pass
 
-    except KeyboardInterrupt:
-        print("\nOperación cancelada por el usuario.")
+        sender = Sender(
+            file_to_send,
+            session_name,
+            config,
+            _cli_print_progress,
+            lambda msg: print(f"\n[Estado] {msg}"),
+            _client_connected,
+            _client_disconnected
+        )
+
+        try:
+            sender.start_session(multiclient=args.multi)
+            
+            if args.multi:
+                print(f"Lobby abierto para la sesión '{session_name}'.")
+                print("Esperando que los clientes se unan...")
+                input(prompt_message) 
+                
+                if not clients_connected:
+                    print("\nAdvertencia: No hay clientes en el lobby. Iniciando de todas formas.")
+                sender.start_transmission()
+            
+            while sender.is_active:
+                time.sleep(1)
+
+            print("\nOperación finalizada.")
+
+        except KeyboardInterrupt:
+            print("\nOperación cancelada por el usuario.")
+        finally:
+            sender.stop_session()
+            
     finally:
-        sender.stop_session()
+        if temp_zip_path and os.path.exists(temp_zip_path):
+            print(f"Limpiando archivo temporal: {temp_zip_path}")
+            os.remove(temp_zip_path)
 
 
 def run_cli_receiver(args, config):
@@ -96,6 +135,7 @@ def run_cli_receiver(args, config):
     sessions_lock = threading.Lock()
     download_complete_event = threading.Event()
     download_status = "pending"
+    final_metadata = {} # --- CORREGIDO: Para almacenar los metadatos finales ---
 
     def _add_session(details):
         with sessions_lock:
@@ -105,12 +145,14 @@ def run_cli_receiver(args, config):
         with sessions_lock:
             active_sessions.pop(session_id, None)
 
-    def _on_cli_download_complete(status):
-        nonlocal download_status
+    # --- CORREGIDO: La callback ahora acepta metadata ---
+    def _on_cli_download_complete(status, metadata):
+        nonlocal download_status, final_metadata
         download_status = status
+        final_metadata = metadata if metadata else {}
         download_complete_event.set()
 
-    receiver = Receiver(config, _cli_print_progress, lambda msg: print(f"[Estado] {msg}"), _on_cli_download_complete)
+    receiver = Receiver(config, _cli_print_progress, lambda msg: print(f"\n[Estado] {msg}"), _on_cli_download_complete)
     service_browser = PyCastServiceBrowser(_add_session, _remove_session, _add_session)
     
     try:
@@ -176,6 +218,20 @@ def run_cli_receiver(args, config):
             
             if download_status == "completed":
                 print("\n¡Descarga completada y verificada con éxito!")
+                
+                # --- CORREGIDO: Usar el nombre de archivo de los metadatos finales ---
+                file_name = final_metadata.get('file_name')
+                if file_name and file_name.endswith(FOLDER_PACKAGE_EXTENSION):
+                    file_path = os.path.join(output_dir, file_name)
+                    print("Paquete de carpeta detectado. Descomprimiendo...")
+                    try:
+                        with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                            zip_ref.extractall(output_dir)
+                        os.remove(file_path) # Limpiar el archivo zip
+                        print("¡Carpeta descomprimida correctamente!")
+                    except (zipfile.BadZipFile, OSError) as e:
+                        print(f"Error al descomprimir la carpeta: {e}")
+
             elif download_status == "failed_verification":
                 print("\n¡ERROR! El archivo recibido estaba corrupto y ha sido eliminado.")
             else:
@@ -259,6 +315,8 @@ class PyCastApp:
         self.progress_text = tk.StringVar()
         self.multiclient_mode_var = tk.BooleanVar(value=self.config.get('multiclient_enabled_by_default'))
         self.active_sessions = {}
+        
+        self.temp_send_file_path = None
 
         self.status_label = None
         self.sessions_tree = None
@@ -272,10 +330,20 @@ class PyCastApp:
         for widget in self.main_container.winfo_children():
             widget.destroy()
 
+    def _cleanup_temp_files(self):
+        """Elimina archivos temporales de compresión si existen."""
+        if self.temp_send_file_path and os.path.exists(self.temp_send_file_path):
+            try:
+                os.remove(self.temp_send_file_path)
+            except OSError as e:
+                print(f"Error al limpiar archivo temporal: {e}")
+            self.temp_send_file_path = None
+
     def create_welcome_screen(self):
         self._clear_container()
         self.root.geometry("400x350")
         self._cleanup_network_services()
+        self._cleanup_temp_files()
         
         self.selected_file_path.set("")
         self.session_name.set("")
@@ -466,21 +534,27 @@ class PyCastApp:
         self.session_name_entry = ttk.Entry(sender_frame, textvariable=self.session_name)
         self.session_name_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         
-        ttk.Label(sender_frame, text="Archivo a Enviar:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(sender_frame, text="Archivo o Carpeta a Enviar:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         self.file_path_entry = ttk.Entry(sender_frame, textvariable=self.selected_file_path, state="readonly")
         self.file_path_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
-        self.select_file_btn = ttk.Button(sender_frame, text="Seleccionar...", command=self._select_file)
-        self.select_file_btn.grid(row=1, column=2, sticky="ew", padx=5, pady=5)
+        
+        btn_frame = ttk.Frame(sender_frame)
+        btn_frame.grid(row=1, column=2, sticky="ew", padx=5, pady=5)
+        self.select_file_btn = ttk.Button(btn_frame, text="Archivo...", command=self._select_file)
+        self.select_file_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.select_folder_btn = ttk.Button(btn_frame, text="Carpeta...", command=self._select_folder_to_send)
+        self.select_folder_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5,0))
 
-        self.drop_target_frame = ttk.LabelFrame(sender_frame, text="Arrastra y suelta un archivo aquí", padding="10")
+
+        self.drop_target_frame = ttk.LabelFrame(sender_frame, text="Arrastra y suelta un archivo o carpeta aquí", padding="10")
         self.drop_target_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=5, pady=10)
         self.drop_target_frame.grid_columnconfigure(0, weight=1)
-        ttk.Label(self.drop_target_frame, text="O haz clic en 'Seleccionar...' arriba", anchor="center").grid(row=0, column=0, sticky="ew", pady=5)
+        ttk.Label(self.drop_target_frame, text="O usa los botones de selección de arriba", anchor="center").grid(row=0, column=0, sticky="ew", pady=5)
 
         self.drop_target_frame.drop_target_register(DND_FILES)
         self.drop_target_frame.dnd_bind('<<Drop>>', self._on_file_drop_dnd)
-        self.drop_target_frame.bind("<Enter>", lambda e: self.drop_target_frame.config(text="¡Suelta el archivo!"))
-        self.drop_target_frame.bind("<Leave>", lambda e: self.drop_target_frame.config(text="Arrastra y suelta un archivo aquí"))
+        self.drop_target_frame.bind("<Enter>", lambda e: self.drop_target_frame.config(text="¡Suéltalo!"))
+        self.drop_target_frame.bind("<Leave>", lambda e: self.drop_target_frame.config(text="Arrastra y suelta un archivo o carpeta aquí"))
 
         self.multiclient_checkbox = ttk.Checkbutton(sender_frame, text="Enviar a múltiples clientes", variable=self.multiclient_mode_var, command=self._on_multiclient_toggle)
         self.multiclient_checkbox.grid(row=3, column=0, columnspan=3, sticky='w', padx=5, pady=5)
@@ -506,7 +580,7 @@ class PyCastApp:
         self.progress_bar = ttk.Progressbar(sender_frame, variable=self.progress_var, maximum=100)
         self.progress_label = ttk.Label(sender_frame, textvariable=self.progress_text, anchor="center")
         
-        self.status_label = ttk.Label(sender_frame, text="Selecciona un archivo para enviar.")
+        self.status_label = ttk.Label(sender_frame, text="Selecciona un archivo o carpeta para enviar.")
         self.status_label.grid(row=9, column=0, columnspan=3, sticky="w", padx=5, pady=10)
         
         back_btn = ttk.Button(sender_frame, text="← Volver al Menú Principal", command=self.create_welcome_screen)
@@ -516,24 +590,67 @@ class PyCastApp:
 
     def _on_file_drop_dnd(self, event):
         files = self.root.tk.splitlist(event.data)
+        self.drop_target_frame.config(text="Arrastra y suelta un archivo o carpeta aquí")
         if not files:
-            messagebox.showwarning("Error de Arrastre", "No se pudo identificar el archivo soltado.", parent=self.root)
+            messagebox.showwarning("Error de Arrastre", "No se pudo identificar la ruta soltada.", parent=self.root)
             return
         if len(files) > 1:
-            messagebox.showinfo("Información", "Solo se puede enviar un archivo a la vez. Se usará el primero de la lista.", parent=self.root)
-        file_path = files[0]
-        if os.path.isfile(file_path):
-            self.selected_file_path.set(file_path)
-            self.session_name.set(os.path.basename(file_path))
+            messagebox.showinfo("Información", "Solo se puede enviar un elemento a la vez. Se usará el primero de la lista.", parent=self.root)
+        
+        path = files[0]
+        if os.path.isfile(path):
+            self.selected_file_path.set(path)
+            self.session_name.set(os.path.basename(path))
             self._set_sender_ui_state('ready')
+        elif os.path.isdir(path):
+            threading.Thread(target=self._prepare_folder_to_send, args=(path,), daemon=True).start()
         else:
-            messagebox.showwarning("Error de Arrastre", f"El elemento soltado no es un archivo válido o no existe:\n{file_path}", parent=self.root)
-        self.drop_target_frame.config(text="Arrastra y suelta un archivo aquí")
+            messagebox.showwarning("Error de Arrastre", f"El elemento soltado no es un archivo o carpeta válida:\n{path}", parent=self.root)
+
+    def _prepare_folder_to_send(self, folder_path):
+        """Comprime una carpeta en un archivo temporal y actualiza la GUI."""
+        self.root.after(0, lambda: self._update_status(f"Comprimiendo '{os.path.basename(folder_path)}'..."))
+        self.root.after(0, lambda: self._set_sender_ui_state('initial'))
+        self._cleanup_temp_files()
+        
+        try:
+            # --- CORRECCIÓN PARA INCLUIR CARPETA RAÍZ EN EL ZIP ---
+            # Se usan rutas absolutas para que shutil.make_archive funcione correctamente
+            # independientemente del directorio de trabajo actual.
+            folder_to_zip = os.path.abspath(folder_path)
+            base_name = os.path.basename(folder_to_zip)
+            parent_dir = os.path.dirname(folder_to_zip)
+            
+            # El nombre base del archivo zip se genera en el directorio original para evitar conflictos.
+            zip_base_path = os.path.join(os.path.dirname(folder_path), os.path.basename(folder_path))
+
+            temp_zip_path = shutil.make_archive(
+                base_name=zip_base_path,
+                format='zip',
+                root_dir=parent_dir,
+                base_dir=base_name
+            )
+            # --- FIN DE LA CORRECCIÓN ---
+            
+            final_zip_path = temp_zip_path.replace('.zip', FOLDER_PACKAGE_EXTENSION)
+            os.rename(temp_zip_path, final_zip_path)
+
+            self.temp_send_file_path = final_zip_path
+
+            def _update_gui_after_zip():
+                self.selected_file_path.set(folder_path)
+                self.session_name.set(os.path.basename(folder_path))
+                self._set_sender_ui_state('ready')
+
+            self.root.after(0, _update_gui_after_zip)
+        except Exception as e:
+            messagebox.showerror("Error de Compresión", f"No se pudo comprimir la carpeta: {e}", parent=self.root)
+            self.root.after(0, lambda: self._update_status("Error al preparar la carpeta."))
 
     def _on_multiclient_toggle(self):
         if self.action_btn['state'] == 'normal':
             is_multi = self.multiclient_mode_var.get()
-            self.action_btn.config(text="Enviar Archivo" if not is_multi else "Abrir Lobby")
+            self.action_btn.config(text="Abrir Lobby" if is_multi else "Enviar")
 
     def _set_sender_ui_state(self, state):
         self.clients_tree_label.grid_remove()
@@ -541,21 +658,25 @@ class PyCastApp:
         self.progress_bar.grid_remove()
         self.progress_label.grid_remove()
         is_multi = self.multiclient_mode_var.get()
+        action_text = "Abrir Lobby" if is_multi else "Enviar"
         if state == 'initial':
             self.session_name_entry.config(state="normal")
             self.select_file_btn.config(state="normal")
+            self.select_folder_btn.config(state="normal")
             self.multiclient_checkbox.config(state="normal")
-            self.action_btn.config(text="Enviar Archivo" if not is_multi else "Abrir Lobby", state="disabled")
-            self._update_status("Selecciona un archivo para enviar.")
+            self.action_btn.config(text=action_text, state="disabled")
+            self._update_status("Selecciona un archivo o carpeta para enviar.")
         elif state == 'ready':
             self.session_name_entry.config(state="normal")
             self.select_file_btn.config(state="normal")
+            self.select_folder_btn.config(state="normal")
             self.multiclient_checkbox.config(state="normal")
-            self.action_btn.config(text="Enviar Archivo" if not is_multi else "Abrir Lobby", state="normal")
-            self._update_status("Listo. Pulsa el botón para empezar.")
+            self.action_btn.config(text=action_text, state="normal")
+            self._update_status("Listo para enviar. Pulsa el botón para empezar.")
         elif state == 'lobby':
             self.session_name_entry.config(state="disabled")
             self.select_file_btn.config(state="disabled")
+            self.select_folder_btn.config(state="disabled")
             self.multiclient_checkbox.config(state="disabled")
             self.clients_tree_label.grid(row=4, column=0, columnspan=3, sticky='w', padx=5, pady=(10,0))
             self.clients_frame.grid(row=5, column=0, columnspan=3, sticky='nsew', padx=5)
@@ -564,6 +685,7 @@ class PyCastApp:
         elif state == 'sending':
             self.session_name_entry.config(state="disabled")
             self.select_file_btn.config(state="disabled")
+            self.select_folder_btn.config(state="disabled")
             self.multiclient_checkbox.config(state="disabled")
             self.progress_bar.grid(row=7, column=0, columnspan=3, sticky="ew", padx=5, pady=5, ipady=5)
             self.progress_label.grid(row=8, column=0, columnspan=3, sticky="ew", padx=5)
@@ -586,13 +708,16 @@ class PyCastApp:
             self.sender = None
             self._set_sender_ui_state('ready')
             self._update_progress(0, 0)
+            self._cleanup_temp_files()
             for i in self.clients_tree.get_children(): self.clients_tree.delete(i)
             return
 
-        file_path = self.selected_file_path.get()
+        original_path = self.selected_file_path.get()
+        file_to_send = self.temp_send_file_path if self.temp_send_file_path else original_path
+        
         session_name = self.session_name.get()
-        if not file_path or not os.path.exists(file_path):
-            messagebox.showerror("Error", "El archivo seleccionado no es válido o no existe.")
+        if not file_to_send or not os.path.exists(file_to_send):
+            messagebox.showerror("Error", "El archivo o carpeta seleccionado no es válido o no existe.")
             return
         if not session_name:
             messagebox.showerror("Error", "Asigna un nombre a la sesión.")
@@ -602,7 +727,7 @@ class PyCastApp:
 
         def setup_and_run_sender():
             self.sender = Sender(
-                file_path, session_name, self.config,
+                file_to_send, session_name, self.config,
                 self._update_progress, self._update_status,
                 self._add_client_to_list, self._remove_client_from_list
             )
@@ -688,6 +813,9 @@ class PyCastApp:
                 self.last_bytes_processed = bytes_processed
             elif self.last_bytes_processed == 0:
                 self.progress_text.set(f"{percentage:.1f}%")
+            
+            if bytes_processed == total_bytes and total_bytes > 0:
+                 self._cleanup_temp_files()
 
         self.root.after(0, task)
 
@@ -696,7 +824,14 @@ class PyCastApp:
         if path:
             self.selected_file_path.set(path)
             self.session_name.set(os.path.basename(path))
+            self._cleanup_temp_files()
             self._set_sender_ui_state('ready')
+
+    def _select_folder_to_send(self):
+        """Abre un diálogo para seleccionar una carpeta para enviar."""
+        path = filedialog.askdirectory()
+        if path:
+            threading.Thread(target=self._prepare_folder_to_send, args=(path,), daemon=True).start()
 
     def _select_folder(self):
         path = filedialog.askdirectory()
@@ -707,12 +842,25 @@ class PyCastApp:
         self.service_browser = PyCastServiceBrowser(self._add_session, self._remove_session, self._update_session)
         self.receiver.start_listening()
         
-    def _on_download_complete(self, status="completed"):
+    # --- CORREGIDO: El callback ahora acepta metadata ---
+    def _on_download_complete(self, status, metadata):
         def task():
             if status == "completed":
                 self.progress_var.set(100)
                 self.progress_text.set("¡Descarga completa!")
-                self._update_status("¡Descarga completa! Listo para una nueva descarga.")
+                final_status_msg = "¡Descarga completa! Listo para una nueva descarga."
+
+                # --- CORREGIDO: Usar el nombre de archivo de los metadatos recibidos ---
+                file_name = metadata.get('file_name')
+                if file_name and file_name.endswith(FOLDER_PACKAGE_EXTENSION):
+                    session_name = metadata.get('session_name', 'paquete')
+                    final_status_msg = f"Paquete '{session_name}' recibido. Descomprimiendo..."
+                    self._update_status(final_status_msg)
+                    file_path = os.path.join(self.selected_folder_path.get(), file_name)
+                    threading.Thread(target=self._decompress_folder, args=(file_path,), daemon=True).start()
+                else:
+                    self._update_status(final_status_msg)
+
             elif status == "cancelled":
                 self.progress_var.set(0)
                 self.progress_text.set("Descarga cancelada")
@@ -728,6 +876,23 @@ class PyCastApp:
             if self.join_btn and self.join_btn.winfo_exists():
                 self.join_btn.config(state='normal')
         self.root.after(0, task)
+
+    def _decompress_folder(self, zip_path):
+        """Descomprime una carpeta recibida y limpia el archivo zip."""
+        try:
+            if not os.path.exists(zip_path): return
+            
+            destination_folder = os.path.dirname(zip_path)
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(destination_folder)
+            
+            os.remove(zip_path)
+            self.root.after(0, lambda: self._update_status("¡Carpeta recibida con éxito!"))
+
+        except (zipfile.BadZipFile, OSError) as e:
+            self.root.after(0, lambda: self._update_status(f"Error al descomprimir: {e}"))
+            messagebox.showerror("Error de Descompresión", f"Ocurrió un error al descomprimir la carpeta: {e}", parent=self.root)
+
 
     def _add_session(self, details):
         if self.sessions_tree and self.sessions_tree.winfo_exists():
@@ -801,6 +966,7 @@ class PyCastApp:
 
     def _on_closing(self):
         if messagebox.askokcancel("Salir", "¿Estás seguro de que quieres salir?"):
+            self._cleanup_temp_files()
             self._cleanup_network_services()
             self.root.destroy()
 
@@ -808,35 +974,34 @@ class PyCastApp:
         self.root.mainloop()
 
 if __name__ == "__main__":
-    # --- MODIFICADO: argparse con ayuda mejorada y ejemplos ---
     examples = """
 Ejemplos de uso:
   # Enviar un archivo en modo directo (un solo receptor)
   python pycast_app.py send ./documento.pdf
 
-  # Enviar un archivo a múltiples receptores con un nombre de sesión personalizado
-  python pycast_app.py send ./fotos.zip --name "Fotos de la Fiesta" --multi
+  # Enviar una CARPETA a múltiples receptores con un nombre de sesión personalizado
+  python pycast_app.py send ./mis_fotos/ --name "Fotos de la Fiesta" --multi
 
-  # Buscar y recibir un archivo en la carpeta por defecto
+  # Buscar y recibir un archivo o carpeta en la carpeta por defecto
   python pycast_app.py receive
 
-  # Recibir un archivo y guardarlo en una carpeta específica
+  # Recibir un elemento y guardarlo en una carpeta específica
   python pycast_app.py receive --output-dir /tmp/descargas/
 """
     parser = argparse.ArgumentParser(
-        description="PyCast: Herramienta de transferencia de archivos en LAN.",
+        description="PyCast: Herramienta de transferencia de archivos y carpetas en LAN.",
         epilog=examples,
         formatter_class=argparse.RawTextHelpFormatter
     )
     subparsers = parser.add_subparsers(dest='command', help='Comandos:')
     
-    send_parser = subparsers.add_parser('send', help='Enviar un archivo.')
-    send_parser.add_argument('file_path', metavar='ARCHIVO', help='Ruta al archivo que se va a enviar.')
-    send_parser.add_argument('--name', help='Nombre personalizado para la sesión (por defecto: nombre del archivo).')
+    send_parser = subparsers.add_parser('send', help='Enviar un archivo o carpeta.')
+    send_parser.add_argument('file_path', metavar='RUTA', help='Ruta al archivo o carpeta que se va a enviar.')
+    send_parser.add_argument('--name', help='Nombre personalizado para la sesión (por defecto: nombre del archivo/carpeta).')
     send_parser.add_argument('--multi', action='store_true', help='Habilitar modo multi-cliente (lobby). Se esperará a que el usuario presione Enter para iniciar la transmisión.')
     
-    receive_parser = subparsers.add_parser('receive', help='Recibir un archivo.')
-    receive_parser.add_argument('--output-dir', metavar='CARPETA', help='Carpeta para guardar los archivos descargados (por defecto: la configurada en la app).')
+    receive_parser = subparsers.add_parser('receive', help='Recibir un archivo o carpeta.')
+    receive_parser.add_argument('--output-dir', metavar='CARPETA', help='Carpeta para guardar los elementos descargados (por defecto: la configurada en la app).')
     
     args = parser.parse_args()
 

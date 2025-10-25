@@ -6,7 +6,7 @@ import socket
 CONFIG_FILE = 'config.json'
 
 CONFIG_PRESETS = {
-    "Wi-Fi Inestable": {
+    "Máxima Estabilidad (Redes Lentas)": {
         "help": "Ideal para redes Wi-Fi congestionadas o con mala señal. Prioriza la estabilidad sobre la velocidad.",
         "settings": {
             "chunk_size": 4096,
@@ -15,7 +15,7 @@ CONFIG_PRESETS = {
             "repair_rounds": 8
         }
     },
-    "Wi-Fi (Estándar)": {
+    "Equilibrado (Uso General)": {
         "help": "Un perfil equilibrado para la mayoría de redes inalámbricas. Es el recomendado por defecto.",
         "settings": {
             "chunk_size": 8192,
@@ -24,7 +24,7 @@ CONFIG_PRESETS = {
             "repair_rounds": 5
         }
     },
-    "Ethernet (Rápido)": {
+    "Alta Velocidad (Redes Rápidas)": {
         "help": "Optimizado para redes cableadas (1Gbps). Aumenta la velocidad asumiendo una conexión estable y de baja latencia.",
         "settings": {
             "chunk_size": 16384,
@@ -33,7 +33,7 @@ CONFIG_PRESETS = {
             "repair_rounds": 4
         }
     },
-    "Ethernet (Extremo)": {
+    "Rendimiento Extremo (Redes Gigabit)": {
         "help": "Configuración agresiva para exprimir al máximo redes Gigabit. Puede fallar si la red no es perfecta.",
         "settings": {
             # --- VALORES MODIFICADOS PARA ESTABILIDAD ---
@@ -58,7 +58,7 @@ CONFIG_METADATA = {
         "help": "La carpeta donde se guardarán los archivos recibidos."
     },
     "multiclient_enabled_by_default": {
-        "default": False,
+        "default": True, # --- VALOR MODIFICADO ---
         "label": "Habilitar modo multi-cliente por defecto",
         "help": "Si está marcado, la opción 'Enviar a múltiples clientes' estará activada por defecto en la pantalla de envío."
     },
