@@ -1,8 +1,8 @@
 # 📡 PyCast
 
-**Herramienta de transferencia de archivos en red local (LAN) simple y potente, utilizando multicast para envíos a múltiples clientes y descubrimiento automático de servicios.**
+**Herramienta de transferencia de archivos en red local (LAN) simple, potente y fiable. Utiliza multicast para envíos a múltiples clientes y descubrimiento automático de servicios.**
 
-PyCast elimina la fricción al compartir archivos en una red local. No necesitas la nube, servidores externos o configurar direcciones IP. Simplemente ejecuta la aplicación, elige un archivo y envíalo. Otros usuarios en la red verán tu sesión al instante y podrán descargar el archivo.
+PyCast elimina la fricción al compartir archivos en una red local. No necesitas la nube, servidores externos o configurar direcciones IP. Simplemente ejecuta la aplicación, elige un archivo y envíalo. Otros usuarios en la red verán tu sesión al instante y podrán descargar el archivo con la seguridad de que llegará sin corrupción.
 
 ### Vistazo Rápido (GUI)
 
@@ -16,14 +16,14 @@ PyCast elimina la fricción al compartir archivos en una red local. No necesitas
 ## ✨ Características Principales
 
 *   **🪄 Descubrimiento Mágico:** Gracias a Zeroconf (Bonjour/Avahi), los usuarios se encuentran en la red sin ninguna configuración. ¡Simplemente funciona!
-*   **💻 Interfaz Dual:** Úsalo con una cómoda interfaz gráfica (GUI) o intégralo en tus scripts gracias a su potente interfaz de línea de comandos (CLI).
+*   **💻 Interfaz Dual:** Úsalo con una cómoda interfaz gráfica (GUI) con soporte para **arrastrar y soltar** (Drag & Drop), o intégralo en tus scripts gracias a su potente interfaz de línea de comandos (CLI).
+*   **✔️ Verificación de Integridad:** PyCast calcula una suma de verificación (CRC32) antes de enviar un archivo y la comprueba al recibirlo. Esto garantiza que el fichero transferido es una copia exacta del original y no se ha corrompido durante el envío.
 *   **✌️ Dos Modos de Envío:**
-    *   **Modo Directo:** Envía un archivo a un único receptor de forma rápida.
-    *   **Modo Lobby:** Abre una "sala de espera" para que múltiples receptores se unan. ¡Ideal para compartir un archivo con todo un equipo a la vez!
-*   **📶 Transmisión Eficiente:** Utiliza multicast para el modo multi-cliente, enviando un solo flujo de datos que es recibido por todos los participantes, optimizando el uso de la red.
-*   **🖥️ Interfaz Gráfica Clara:** Construida con Tkinter para ser accesible y fácil de usar.
-*   **⚙️ Configurable:** Permite personalizar tu nombre de usuario y la carpeta de descargas por defecto.
-*   **🐧 Agnóstico de Distribución:** Al estar construido con Python, PyCast es compatible con la mayoría de distribuciones de Linux.
+    *   **Modo Directo:** Envía un archivo a un único receptor de forma rápida y sencilla.
+    *   **Modo Lobby:** Abre una "sala de espera" para que múltiples receptores se unan. Ideal para compartir un archivo con todo un equipo, una clase o un grupo de amigos a la vez.
+*   **📡 Transmisión Robusta y Eficiente:** Utiliza un protocolo de retransmisión basado en NACKs sobre multicast. Esto significa que envía un solo flujo de datos que es recibido por todos, y si un cliente pierde un paquete, solo él lo solicita de nuevo, optimizando el uso de la red sin sacrificar la fiabilidad.
+*   **🚀 Rendimiento Adaptable:** Incluye perfiles de red preconfigurados (Wi-Fi, Ethernet) y permite un ajuste avanzado de los parámetros de transmisión (tamaño de paquete, bloques, etc.) para optimizar el rendimiento según la calidad de tu red.
+*   **⚙️ Configurable:** Permite personalizar tu nombre de usuario y la carpeta de descargas por defecto para que se ajuste a tu flujo de trabajo.
 
 ---
 
@@ -70,7 +70,7 @@ python pycast_app.py
 
 **Para Enviar un Archivo:**
 *   Haz clic en **"Enviar un Archivo"**.
-*   Elige el archivo. El nombre de la sesión se rellenará automáticamente.
+*   **Arrastra y suelta** el archivo en el área indicada o haz clic en **"Seleccionar..."**. El nombre de la sesión se rellenará automáticamente.
 *   Decide si quieres usar el modo **multi-cliente** marcando la casilla.
     *   **Modo Directo (casilla desmarcada):** Pulsa **"Enviar Archivo"**. La transferencia comenzará tan pronto como un receptor se conecte.
     *   **Modo Lobby (casilla marcada):** Pulsa **"Abrir Lobby"**. Verás cómo los clientes se unen a la lista. Cuando todos estén listos, pulsa **"Iniciar Transmisión"**.
@@ -78,73 +78,65 @@ python pycast_app.py
 **Para Recibir un Archivo:**
 *   Haz clic en **"Recibir un Archivo"**.
 *   Las sesiones disponibles en la red aparecerán en la lista.
-*   Selecciona la sesión que te interese.
-*   Asegúrate de que la carpeta de destino es la correcta.
-*   Haz clic en **"Unirse y Descargar"**. La descarga comenzará de inmediato (modo directo) o cuando el emisor la inicie (modo lobby).
+*   Selecciona la sesión que te interese y haz clic en **"Unirse y Descargar"**.
 
 ### Modo de Línea de Comandos (CLI)
 
-La CLI es ideal para scripting o para usuarios que prefieren la terminal. Se usa con los subcomandos `send` y `receive`.
+La CLI es ideal para scripting o para usuarios que prefieren la terminal. Para ver todas las opciones y ejemplos, usa el comando `python pycast_app.py -h`.
 
 **Para Enviar un Archivo:**
-El comando base es `python pycast_app.py send <archivo> [opciones]`.
-
-*   **Ejemplo 1: Envío directo simple.**
+*   **Envío directo simple:**
     ```bash
     python pycast_app.py send ./documento.pdf
     ```
-    La terminal esperará a que un receptor se una para iniciar la transferencia.
+    *La terminal esperará a que un receptor se una para iniciar la transferencia.*
 
-*   **Ejemplo 2: Envío con nombre de sesión personalizado.**
+*   **Envío a múltiples clientes con nombre de sesión personalizado (modo lobby):**
     ```bash
-    python pycast_app.py send ./media.zip --name "Fotos del Evento"
+    python pycast_app.py send ./instalador.deb --name "Instalador Linux" --multi
     ```
-
-*   **Ejemplo 3: Envío a múltiples clientes (modo lobby).**
-    ```bash
-    python pycast_app.py send ./instalador.deb --multi
-    ```
-    Se abrirá un lobby. Verás los clientes que se conectan y deberás presionar `Enter` para iniciar la transmisión para todos a la vez.
+    *Se abrirá un lobby. Verás los clientes que se conectan y deberás presionar `Enter` para iniciar la transmisión para todos a la vez.*
 
 **Para Recibir un Archivo:**
-El comando base es `python pycast_app.py receive [opciones]`.
-
-*   **Ejemplo 1: Buscar y recibir un archivo.**
+*   **Buscar y elegir qué descargar:**
     ```bash
     python pycast_app.py receive
     ```
-    La aplicación buscará sesiones, te mostrará una lista numerada y te pedirá que elijas cuál descargar.
-    ```
-    Buscando sesiones en la red (Ctrl+C para salir)...
+    *La aplicación buscará sesiones, te mostrará una lista numerada y te pedirá que elijas cuál descargar.*
+    ```    Buscando sesiones en la red (Ctrl+C para salir)...
 
     Sesiones disponibles:
       1) 'documento.pdf' por usuario-pc1 [available]
-      2) 'Fotos del Evento' por usuario-pc2 [available]
+      2) 'Instalador Linux' por admin-server [available]
     
-    Elige el número de la sesión a descargar (o 'q' para salir): 1
+    Elige el número de la sesión a descargar (o 'q' para salir): 2
     ```
 
-*   **Ejemplo 2: Recibir un archivo en una carpeta específica.**
+*   **Recibir y guardar en una carpeta específica:**
     ```bash
-    python pycast_app.py receive --output-dir /home/usuario/Documentos/Proyecto/
+    python pycast_app.py receive --output-dir /home/usuario/Descargas/Temporal/
     ```
-
-> **Consejo:** En cualquier momento durante una operación en la CLI, puedes presionar `Ctrl+C` para cancelarla de forma segura.
 
 ---
 
-## ⚠️ Posibles Problemas de Firewall
+## ⚠️ Posibles Problemas de Red y Firewall
 
-La comunicación en red de PyCast puede ser bloqueada por un firewall local. Si experimentas problemas (no aparecen sesiones, errores de conexión), es muy probable que necesites abrir algunos puertos.
+### Una Nota Importante sobre Wi-Fi y Multicast
 
-**Síntomas comunes:**
-*   **No ves ninguna sesión disponible:** El firewall está bloqueando Zeroconf/mDNS (puerto 5353/udp).
-*   **Ves una sesión pero da error al unirte:** El firewall del *emisor* está bloqueando el puerto de conexión (5008/tcp).
-*   **Te unes, pero la descarga no avanza:** El firewall del *receptor* está bloqueando la recepción de datos multicast (puerto 5007/udp).
+La tecnología Multicast, que PyCast utiliza para ser tan eficiente en envíos a múltiples clientes, puede ser poco fiable en redes inalámbricas (Wi-Fi). Muchos routers domésticos y puntos de acceso corporativos limitan o bloquean el tráfico multicast por defecto para preservar el ancho de banda aéreo.
 
-### Solución
+**Síntomas de problemas de multicast en Wi-Fi:**
+*   Clientes que no ven la sesión o desaparece y reaparece.
+*   La descarga se inicia pero se detiene o falla para algunos clientes.
+*   Rendimiento muy bajo en comparación con una conexión por cable.
 
-Necesitas permitir el tráfico en los siguientes puertos:
+**Recomendación:**
+Para máxima fiabilidad, especialmente con archivos grandes o múltiples clientes, **se recomienda encarecidamente una conexión por cable (Ethernet) para todos los participantes**. Si debes usar Wi-Fi, asegúrate de tener una señal fuerte y estar cerca del router.
+
+### Configuración del Firewall
+
+Si experimentas problemas de conexión, es muy probable que un firewall local esté bloqueando la comunicación. Necesitas permitir el tráfico en los siguientes puertos:
+
 *   `5353/udp` para el descubrimiento de servicios (mDNS).
 *   `5008/tcp` para la conexión inicial entre cliente y servidor (handshake).
 *   `5007/udp` para la transferencia de datos del archivo (multicast).
