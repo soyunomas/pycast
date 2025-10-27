@@ -264,7 +264,7 @@ class Sender:
                         print(f"[SND] Fin del bloque {block_idx}. Ronda de reparación {repair_round + 1}/{self.REPAIR_ROUNDS}. Esperando NACKs...")
                         
                         block_end_packet = {"type": "block_end", "session_id": self.session_id, "block_index": block_idx}
-                        for _ in range(2):
+                        for _ in range(3):
                             multicast_socket.sendto(json.dumps(block_end_packet).encode('utf-8'), (MULTICAST_GROUP, MULTICAST_PORT))
                             time.sleep(0.01)
 

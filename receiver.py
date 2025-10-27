@@ -82,7 +82,6 @@ class Receiver:
 
     def join_session(self, session_info, destination_folder):
         self._cleanup_temp_file()
-        # --- CORREGIDO: Copiamos los datos iniciales, pero se sobreescribirán con los metadatos reales ---
         self.current_session_info = session_info.copy()
         self.progress_callback(0, 0)
         self.received_seqs_current_block.clear()
@@ -121,7 +120,6 @@ class Receiver:
                 self.status_callback("La transmisión fue cancelada por el emisor.")
                 self._cleanup_temp_file()
                 self.joined_session_id = None
-                # --- MODIFICADO: Notificar cancelación con metadata nula ---
                 self.completion_callback(status="cancelled", metadata=None)
         
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -133,47 +131,66 @@ class Receiver:
             self.output_file.write(data[20:])
             self.received_seqs_current_block.add(seq_num)
     
-    def _handle_block_end(self, packet):
-        block_idx = packet['block_index']
-        
-        if block_idx <= self.last_processed_block: 
-            return
-            
-        print(f"\n[RCV] RECIBIDO FIN_DE_BLOQUE para el bloque {block_idx}.")
-        
-        if block_idx > self.last_processed_block + 1:
-            print(f"[RCV] ADVERTENCIA: Se saltó del bloque {self.last_processed_block} al {block_idx}. ¡El paquete 'fin de bloque' anterior probablemente se perdió!")
+    # --- INICIO DE LA CORRECCIÓN REFACTORIZADA ---
 
-
+    def _check_and_process_block(self, block_to_check):
+        """
+        Verifica un único bloque. Si está completo, lo procesa y devuelve True.
+        Si está incompleto, envía un NACK y devuelve False.
+        """
         block_size = self.current_session_info['block_size_packets']
         total_chunks = self.current_session_info['total_chunks']
-        start_seq, end_seq = block_idx * block_size, min((block_idx + 1) * block_size, total_chunks)
+        start_seq = block_to_check * block_size
+        end_seq = min((block_to_check + 1) * block_size, total_chunks)
         
         expected_seqs = set(range(start_seq, end_seq))
-        missing_seqs = list(expected_seqs - self.received_seqs_current_block)
+        received_in_this_block = {s for s in self.received_seqs_current_block if start_seq <= s < end_seq}
+        missing_seqs = list(expected_seqs - received_in_this_block)
 
         if missing_seqs:
-            print(f"[RCV] Bloque {block_idx}: Faltan {len(missing_seqs)} paquetes. Enviando NACK. (Ej: {missing_seqs[:5]})")
-            nack_packet = {"session_id": self.joined_session_id, "block_index": block_idx, "missing_seqs": missing_seqs}
+            print(f"[RCV] Bloque {block_to_check}: Incompleto. Faltan {len(missing_seqs)} paquetes. Enviando NACK.")
+            nack_packet = {"session_id": self.joined_session_id, "block_index": block_to_check, "missing_seqs": missing_seqs}
             try:
                 self.nack_socket.sendto(json.dumps(nack_packet).encode('utf-8'), (self.sender_address, NACK_PORT))
             except Exception as e:
-                print(f"[RCV] Error enviando NACK: {e}")
+                print(f"[RCV] Error enviando NACK para bloque {block_to_check}: {e}")
+            return False
         else:
-            print(f"[RCV] Bloque {block_idx} completo y verificado. No se necesita NACK.")
-            self.last_processed_block = block_idx
-            self.received_seqs_current_block.clear()
-            
+            print(f"[RCV] Bloque {block_to_check}: Completo y verificado.")
+            self.received_seqs_current_block -= expected_seqs
             total_bytes = self.current_session_info['file_size']
-            bytes_processed = min((block_idx + 1) * block_size * self.CHUNK_SIZE, total_bytes)
+            bytes_processed = min((block_to_check + 1) * block_size * self.CHUNK_SIZE, total_bytes)
             self.progress_callback(bytes_processed, total_bytes)
+            self.status_callback(f"Bloque {block_to_check + 1} recibido correctamente.")
+            return True
 
-            self.status_callback(f"Bloque {block_idx + 1} recibido correctamente.")
+    def _handle_block_end(self, packet):
+        """
+        Orquesta la verificación de bloques. Itera sobre todos los bloques
+        pendientes desde el último procesado hasta el actual.
+        """
+        block_idx_received = packet['block_index']
+        if block_idx_received <= self.last_processed_block:
+            return
+
+        can_advance_state = True
+        for block_to_check in range(self.last_processed_block + 1, block_idx_received + 1):
+            is_block_complete = self._check_and_process_block(block_to_check)
+            
+            # Solo podemos avanzar nuestro estado 'last_processed_block' si los
+            # bloques se completan en orden secuencial.
+            if can_advance_state and is_block_complete:
+                self.last_processed_block = block_to_check
+            else:
+                # En cuanto encontramos un bloque incompleto, rompemos la secuencia.
+                # Podemos seguir enviando NACKs para bloques futuros, pero no podemos
+                # marcarlos como 'procesados'.
+                can_advance_state = False
+    
+    # --- FIN DE LA CORRECCIÓN REFACTORIZADA ---
 
     def _handle_metadata(self, packet):
-        # --- CORREGIDO: Los metadatos del paquete son la fuente de verdad. Reemplazamos info anterior. ---
         self.current_session_info.update(packet)
-        
         original_chunk_size = self.CHUNK_SIZE
         self.CHUNK_SIZE = self.current_session_info.get('chunk_size', self.CHUNK_SIZE)
         
@@ -217,7 +234,6 @@ class Receiver:
 
             if expected_crc is None:
                 self.status_callback(f"Archivo '{self.current_session_info['file_name']}' descargado. (Sin verificación CRC)")
-                # --- MODIFICADO: Pasar metadatos al callback ---
                 self.completion_callback(status="completed", metadata=self.current_session_info)
                 return
 
@@ -228,13 +244,11 @@ class Receiver:
                 self.status_callback(f"Archivo '{self.current_session_info['file_name']}' descargado y verificado con éxito.")
                 total_bytes = self.current_session_info.get('file_size', 1)
                 self.progress_callback(total_bytes, total_bytes)
-                # --- MODIFICADO: Pasar metadatos al callback ---
                 self.completion_callback(status="completed", metadata=self.current_session_info)
             else:
                 print(f"[RCV] ¡FALLO DE VERIFICACIÓN! Esperado: (size={expected_size}, crc={expected_crc}), Recibido: (size={received_size}, crc={received_crc})")
                 self.status_callback("¡ERROR! El archivo está corrupto. Eliminando...")
                 os.remove(output_path) 
-                # --- MODIFICADO: Pasar metadatos al callback ---
                 self.completion_callback(status="failed_verification", metadata=self.current_session_info)
 
         except Exception as e:
